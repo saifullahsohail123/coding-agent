@@ -1,0 +1,6 @@
+langgraph
+langchain-ollama
+langchain-community
+langchain-core
+pydantic
+sqlite3
