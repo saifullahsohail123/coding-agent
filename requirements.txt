@@ -3,3 +3,7 @@ langchain-ollama
 langchain-community
 langchain-core
 pydantic
+fastapi
+uvicorn
+websockets
+python-multipart
