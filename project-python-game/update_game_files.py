@@ -1,0 +1,1 @@
+import os\ndef update_game_files():\n    files = ['snake_game.py', 'game.py']\n    for file in files:\n        with open(file, 'a') as f:\n            f.write('\n# This line was added by the game updater.')\n\nif __name__ == '__main__':\n    update_game_files()
