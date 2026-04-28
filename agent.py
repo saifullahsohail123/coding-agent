@@ -84,12 +84,40 @@ class AgentState(TypedDict):
 # --- 3. TOOLS ---
 @tool
 def execute_shell(command: str):
-    """Executes a terminal command inside the project root."""
+    """Executes a terminal command INSIDE the project directory using a project-local virtual environment."""
+    import sys
+    
+    # Path to the project-local venv
+    venv_dir = os.path.join(PROJECT_ROOT, "venv")
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    python_exe = os.path.join(venv_dir, bin_dir, "python")
+    
+    # 1. Create venv if it doesn't exist
+    if not os.path.exists(venv_dir):
+        print(f"[*] Creating local virtual environment in {PROJECT_ROOT}...")
+        subprocess.run([sys.executable, "-m", "venv", venv_dir], check=True)
+    
+    # 2. Prepare environment with venv's bin in the front of PATH
+    env = os.environ.copy()
+    env["PATH"] = f"{os.path.join(venv_dir, bin_dir)}{os.pathsep}{env.get('PATH', '')}"
+    env["VIRTUAL_ENV"] = venv_dir
+    
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60, cwd=PROJECT_ROOT)
-        return f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}\nEXIT_CODE: {result.returncode}"
+        # 3. If it's a python command, we might want to ensure it uses the local python
+        # But by putting venv/bin in PATH, 'python' and 'pip' should resolve correctly.
+        result = subprocess.run(
+            command, 
+            shell=True, 
+            capture_output=True, 
+            text=True, 
+            timeout=120,
+            cwd=PROJECT_ROOT,
+            env=env
+        )
+        output = f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}\nEXIT_CODE: {result.returncode}"
+        return output
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"CRITICAL ERROR: {str(e)}"
 
 @tool
 def write_to_disk(filename: str, content: str):

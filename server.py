@@ -40,14 +40,12 @@ async def select_project(project: ProjectInfo):
     if not os.path.exists(project_dir):
         os.makedirs(project_dir)
     
-    # Update global in agent.py
-    # NOTE: This is simplistic for one user at a time
     agent.PROJECT_ROOT = project_dir
     agent.DB_PATH = os.path.join(project_dir, "chat_history.db")
-    import sqlite3
-    from langgraph.checkpoint.sqlite import SqliteSaver
-    db_conn = sqlite3.connect(agent.DB_PATH, check_same_thread=False)
-    agent.memory = SqliteSaver(db_conn)
+    
+    # We use AsyncSqliteSaver for the web backend
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    agent.memory = AsyncSqliteSaver.from_conn_string(agent.DB_PATH)
     
     return {"status": "success", "project": project_dir}
 
@@ -55,67 +53,61 @@ async def select_project(project: ProjectInfo):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     
-    # We'll use the compiled agent from agent.py
     if not agent.memory:
         await websocket.send_json({"type": "error", "message": "Project not selected"})
         await websocket.close()
         return
         
-    compiled_agent = agent.get_app(agent.memory)
-    
-    try:
-        while True:
-            data = await websocket.receive_text()
-            payload = json.loads(data)
-            
-            user_text = payload.get("text")
-            image_b64 = payload.get("image") # Base64 without header
-            is_resume = payload.get("resume", False)
-            
-            config = {"configurable": {"thread_id": "main"}}
-            
-            if is_resume:
-                # Update state with feedback if provided
-                if user_text:
-                    compiled_agent.update_state(config, {"messages": [HumanMessage(content=user_text)]})
-                stream_input = None
-            else:
-                # Fresh prompt
-                content = [{"type": "text", "text": user_text}]
-                if image_b64:
-                    content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
-                stream_input = {"messages": [HumanMessage(content=content)], "iteration_count": 0}
-            
-            # Stream the events
-            async for event in compiled_agent.astream(stream_input, config, stream_mode="messages"):
-                msg, metadata = event
+    # AsyncSqliteSaver.from_conn_string is a context manager
+    async with agent.memory as saver:
+        compiled_agent = agent.get_app(saver)
+        
+        try:
+            while True:
+                data = await websocket.receive_text()
+                payload = json.loads(data)
                 
-                # Determine type of message to send to frontend
-                msg_data = {
-                    "type": "agent_message",
-                    "role": "assistant" if isinstance(msg, AIMessage) else "tool",
-                    "content": msg.content,
-                    "metadata": metadata
-                }
+                user_text = payload.get("text")
+                image_b64 = payload.get("image")
+                is_resume = payload.get("resume", False)
                 
-                if isinstance(msg, AIMessage):
-                    if msg.tool_calls:
+                config = {"configurable": {"thread_id": "main"}}
+                
+                if is_resume:
+                    if user_text:
+                        await compiled_agent.aupdate_state(config, {"messages": [HumanMessage(content=user_text)]})
+                    stream_input = None
+                else:
+                    content = [{"type": "text", "text": user_text}]
+                    if image_b64:
+                        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+                    stream_input = {"messages": [HumanMessage(content=content)], "iteration_count": 0}
+                
+                # Stream messages
+                async for msg, metadata in compiled_agent.astream(stream_input, config, stream_mode="messages"):
+                    msg_data = {
+                        "type": "agent_message",
+                        "role": "assistant" if isinstance(msg, AIMessage) else "tool",
+                        "content": msg.content,
+                        "metadata": metadata
+                    }
+                    if isinstance(msg, AIMessage) and msg.tool_calls:
                         msg_data["tool_calls"] = msg.tool_calls
-                
-                await websocket.send_json(msg_data)
-                
-            # Check if we hit a breakpoint
-            state = compiled_agent.get_state(config)
-            if state.next:
-                await websocket.send_json({"type": "status", "status": "paused", "message": "Action requires approval"})
-            else:
-                await websocket.send_json({"type": "status", "status": "done"})
+                    
+                    await websocket.send_json(msg_data)
+                    
+                # Check for breakpoints
+                state = await compiled_agent.aget_state(config)
+                if state.next:
+                    await websocket.send_json({"type": "status", "status": "paused", "message": "Action requires approval"})
+                else:
+                    await websocket.send_json({"type": "status", "status": "done"})
 
-    except WebSocketDisconnect:
-        print("Client disconnected")
-    except Exception as e:
-        print(f"Error: {e}")
-        await websocket.send_json({"type": "error", "message": str(e)})
+        except WebSocketDisconnect:
+            print("Client disconnected")
+        except Exception as e:
+            print(f"Error: {e}")
+            await websocket.send_json({"type": "error", "message": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
