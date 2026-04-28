@@ -7,10 +7,13 @@ This plan outlines the creation of an autonomous yet supervised coding agent. Th
 The system is built on **LangGraph** (to manage state and cycles) and uses **Ollama** as the default LLM provider.
 
 ### Core Components:
-1. **Multimodal LLM Layer**: Uses `llama3.2-vision` (or similar) via Ollama for text/image processing.
-2. **State Graph**: Defines the "Code -> Run -> Fix -> Review" loop.
-3. **Persistence Layer**: SQLite-based checkpointer to save and resume conversations.
-4. **Toolbox**: File system read/write and subprocess execution.
+### Core Components:
+1. **Hybrid LLM Layer**: 
+   - **Reasoning/Tools**: Uses `llama3.1` (which supports tools).
+   - **Vision**: Uses `llama3.2-vision` (only for describing images).
+2. **Vision-Pre-Processing**: The agent automatically detects images and asks the vision model to "describe" them before the reasoning model takes over.
+3. **State Graph**: Defines the "Plan -> Describe (if image) -> Code -> Run -> Fix -> Review" loop.
+4. **Persistence Layer**: SQLite-based checkpointer to save and resume conversations.
 5. **Human-in-the-loop (HITL)**: Mandatory breakpoint before final execution or destructive changes.
 
 ---
@@ -97,8 +100,11 @@ def initialize_project_env():
     memory = SqliteSaver(db_connection)
     print(f"[*] Session Active in {PROJECT_ROOT}. History: {DB_PATH}")
 
-# LLM: Ollama (Llama 3.2 Vision)
-llm = ChatOllama(model="llama3.2-vision", temperature=0)
+# MODELS
+# Reasoning model (Supports tools)
+llm_tools = ChatOllama(model="llama3.1", temperature=0)
+# Vision model (Supports images, used only for description)
+llm_vision = ChatOllama(model="llama3.2-vision", temperature=0)
 
 # --- 2. STATE DEFINITION ---
 
@@ -148,23 +154,38 @@ def read_from_disk(filename: str):
         return f.read()
 
 tools = [execute_shell, write_to_disk, read_from_disk]
-llm_with_tools = llm.bind_tools(tools)
+llm_with_tools = llm_tools.bind_tools(tools)
 
 # --- 4. GRAPH NODES (AGENT LOGIC) ---
 
 def planner_node(state: AgentState):
-    """Analyzes requirements (Text + Images) and generates a tool call."""
+    """Uses Hybrid approach: Vision model for images, Tool model for logic."""
     messages = state['messages']
     
-    # SYSTEM PROMPT: Defines the agent's behavior
+    # If the user sent an image, we use the vision model to describe it first 
+    # so the tool model can 'understand' what's in the picture.
+    processed_history = []
+    
+    for msg in messages:
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            # Check if this message has an image
+            has_image = any(item.get("type") == "image_url" for item in msg.content if isinstance(item, dict))
+            if has_image:
+                print("[System] Detected image. Requesting visual analysis from llama3.2-vision...")
+                vision_res = llm_vision.invoke([msg])
+                # Convert the multimodal message into a purely text message for the tool model
+                description = f"(Visual Content Analysis: {vision_res.content})"
+                processed_history.append(HumanMessage(content=description))
+                continue
+        processed_history.append(msg)
+
     sys_msg = SystemMessage(content=(
-        "You are 'Antigravity-lite', an expert self-healing coding assistant. "
-        "Use tools to write code, execute it, and fix errors. "
-        "If images tags are present in history, analyze them for UI/Logic requirements."
+        "You are 'Antigravity-lite'. Use tools to solve coding tasks. "
+        "You have been provided with textual descriptions of any images uploaded."
     ))
 
-    # Incorporate images if it's the first time processing them
-    response = llm_with_tools.invoke([sys_msg] + messages)
+    # Use the reasoning model (which supports tools) for the actual plan
+    response = llm_with_tools.invoke([sys_msg] + processed_history)
     
     return {"messages": [response]}
 
@@ -187,18 +208,20 @@ def human_gate_node(state: AgentState):
 
 # --- 5. ROUTING LOGIC ---
 
-def router(state: AgentState):
-    """Logic to decide: Continue, Loop back for fix, or Stop for Human."""
+def route_after_planner(state: AgentState):
+    """Decides if we should execute tools or end the session."""
     last_msg = state['messages'][-1]
-    
-    if not last_msg.tool_calls:
-        return END
-    
-    # Check if there was an execution error in the last response
+    if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+        return "tool_executor"
+    return END
+
+def route_after_tools(state: AgentState):
+    """Decides what to do after tools run: Fix errors or wait for human."""
+    # Check for errors in the tool outputs
     error_detected = any("EXIT_CODE: 0" not in str(m.content) for m in state['messages'] if isinstance(m, ToolMessage) and "EXIT_CODE" in str(m.content))
     
-    # If error detected and we haven't looped too much, try fixing
     if error_detected and state['iteration_count'] < 5:
+        print(f"[System] Error detected (Iteration {state['iteration_count']}). Returning to planner for fix...")
         return "planner"
     
     return "human_gate"
@@ -212,13 +235,21 @@ builder.add_node("tool_executor", tool_executor_node)
 builder.add_node("human_gate", human_gate_node)
 
 builder.set_entry_point("planner")
-builder.add_edge("planner", "tool_executor")
-builder.add_conditional_edges("tool_executor", router, {
-    "planner": "planner",
-    "human_gate": "human_gate",
+
+# From planner, we either go to tools or end
+builder.add_conditional_edges("planner", route_after_planner, {
+    "tool_executor": "tool_executor",
     END: END
 })
-builder.add_edge("human_gate", "planner") # After human resume, it goes back to plan
+
+# From tools, we either go back to planner (for fix) or to human gate
+builder.add_conditional_edges("tool_executor", route_after_tools, {
+    "planner": "planner",
+    "human_gate": "human_gate"
+})
+
+# From human gate, we always go back to planner to process the feedback
+builder.add_edge("human_gate", "planner")
 
 # COMPILE with persistent memory and manual interrupt at human_gate
 def get_app(checkpointer):
